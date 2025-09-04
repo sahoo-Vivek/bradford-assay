@@ -1,0 +1,199 @@
+---
+title: "Bradford QC + Loading (long-format)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: readable
+params:
+  excel_path: "3min_longFormat.xlsx"     # <-- set your file path
+  sheet: "End point"                          # <-- set your sheet
+  loads_ug: [20]                      # desired µg loads per lane
+  cv_flag_threshold: 30                       # flag CV% above this
+  summary_stat: "median"                      # "median" or "mean"
+  linear_cutoff:                              # e.g. 1.5 to trim top standards
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+suppressPackageStartupMessages({
+  library(readxl); library(dplyr); library(stringr); library(tidyr)
+  library(ggplot2); library(ggrepel); library(ggpubr); library(scales)
+})
+theme_set(ggpubr::theme_pubr(base_size = 13))
+```
+
+## 1) Read long-format plate file
+
+```{r read}
+path  <- params$excel_path
+sheet <- params$sheet
+
+raw0 <- read_excel(path, sheet = sheet, col_names = FALSE)
+hdr_row <- which(raw0[[1]] == "Content")[1]
+stopifnot(!is.na(hdr_row))
+
+dat <- read_excel(path, sheet = sheet, skip = hdr_row - 1)
+
+nm <- names(dat)
+nm <- str_replace_all(nm, "\\r\\n", "\n")
+nm <- str_replace_all(nm, fixed("Well\nCol"), "col")
+nm <- str_replace_all(nm, fixed("Well\nRow"), "row")
+nm <- str_replace_all(nm, fixed("Raw Data (A-595)"), "Absorbance")
+nm <- str_replace_all(nm, "Standard Concentrations.*", "std.conc")
+names(dat) <- nm
+
+plate <- dat %>%
+  select(Content, col, row, std.conc = any_of("std.conc"), Absorbance) %>%
+  unite("well_ID", c(row, col), sep = "", remove = TRUE) %>%
+  separate(Content, into = c("Type","id"), sep = " ", remove = FALSE, fill = "right")
+
+ggpubr::ggtexttable(plate)
+```
+
+## 2) Blank correction + (optional) mapping
+
+```{r metadata}
+
+# Blank correction (use median of blank wells for robustness)
+blank_med <- plate %>% filter(Type == "Blank") %>% pull(Absorbance) %>% median(na.rm = TRUE)
+
+proc <- plate %>%
+  filter(Type != "Blank") %>%
+  mutate(cor.Absorbance = Absorbance - blank_med)
+
+
+proc <- proc %>%
+   mutate(desc = case_when(
+    id == "B" ~ "ctrl_NA_NA",
+    id %in% c("X1","X2","X3") ~ "Scr_NA_Unstim",
+    id %in% c("X4","X5","X6") ~ "Scr_NA_BIC",
+    id %in% c("X7","X8","X9") ~ "Scr_MEKi_BIC",
+    id %in% c("X10","X11","X12") ~ "shRNA@Vegfa_NA_BIC",
+    id %in% c("X13","X14","X15") ~ "shRNA@Bhlhe40_NA_BIC",
+    id %in% c("X16","X17","X18") ~ "NA_NA_BIC",   # add if present
+    TRUE ~ NA_character_
+  ))
+```
+
+## Build the standard curve (averaged replicates)
+
+```{r standard curve}
+std_data <- proc %>%
+  filter(Type == "Standard", !is.na(std.conc)) %>%
+  group_by(std.conc) %>%
+  summarise(A595_corr_mean = mean(cor.Absorbance, na.rm = TRUE),
+            A595_corr_sd   = sd(cor.Absorbance,   na.rm = TRUE),
+            n = n(), .groups = "drop")
+
+cutoff <- if (is.null(params$linear_cutoff)) max(std_data$std.conc, na.rm = TRUE) else params$linear_cutoff
+std_fit <- lm(A595_corr_mean ~ std.conc, data = subset(std_data, std.conc <= cutoff))
+sum_std <- summary(std_fit)
+m <- unname(coef(std_fit)[2]); b <- unname(coef(std_fit)[1]); r2 <- sum_std$r.squared
+
+std_plot <- ggplot(std_data, aes(std.conc, A595_corr_mean)) +
+  geom_point(size = 3, color = "#2b8cbe") +
+  geom_errorbar(aes(ymin = A595_corr_mean - A595_corr_sd,
+                    ymax = A595_corr_mean + A595_corr_sd),
+                width = 0.03, color = "#2b8cbe", alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, color = "#de2d26", linewidth = 1) +
+  labs(title = "Bradford standard curve (averaged)",
+       subtitle = paste0("A = ", round(m,3),"·C + ", round(b,3), "   |   R² = ", round(r2,3)),
+       x = "BSA concentration (mg/mL)", y = "A595 (blank-corrected)")
+ggpubr::ggpar(std_plot, legend = "none")
+```
+
+
+
+## 4) Sample concentrations, CVs, flags
+
+```{r reult}
+out <- proc %>%
+  mutate(Conc_ug_per_uL = ifelse(Type == "Sample", (cor.Absorbance - b) / m, NA_real_))
+
+summary_tbl <- out %>%
+  filter(Type == "Sample") %>%
+  mutate(name = Content) %>%
+  group_by(Content, name, desc) %>%
+  summarise(
+    n = n(),
+    mean_conc   = mean(Conc_ug_per_uL, na.rm = TRUE),
+    sd_conc     = sd(Conc_ug_per_uL, na.rm = TRUE),
+    median_conc = median(Conc_ug_per_uL, na.rm = TRUE),
+    cv_percent  = ifelse(mean_conc > 0, (sd_conc/mean_conc)*100, NA_real_),
+    .groups = "drop"
+  ) %>%
+  mutate(flag_high_CV = cv_percent > params$cv_flag_threshold)
+
+sp <- out %>%
+  filter(Type == "Sample") %>%
+  ggplot(aes(Conc_ug_per_uL, desc)) +
+  geom_boxplot(outlier.shape = NA, fill = "#f0f0f0") +
+  geom_jitter(height = 0.15, width = 0, size = 1.8, alpha = 0.8, color = "#636363") +
+  labs(title = "Per-sample concentration spread", x = "Concentration (µg/µL)", y = NULL)
+ggpubr::ggpar(sp, legend = "none")
+
+ggpubr::ggtexttable(head(summary_tbl, 10) |> mutate(across(where(is.numeric), ~round(.x, 3))))
+```
+
+
+## 5) Overlay samples on the curve (medians)
+```{r Overlay}
+samples_plot <- summary_tbl %>%
+  mutate(A595_from_curve = m * median_conc + b, label = ifelse(is.na(desc), name, paste0(name," (",desc,")")))
+
+ov <- ggplot(std_data, aes(x = std.conc, y = A595_corr_mean)) +
+  geom_point(size = 3, color = "#2b8cbe") +
+  geom_smooth(method = "lm", se = FALSE, color = "#de2d26", linewidth = 1) +
+  geom_point(data = samples_plot, aes(x = median_conc, y = A595_from_curve),
+             shape = 4, size = 3, color = "black", stroke = 1.2) +
+  ggrepel::geom_text_repel(data = samples_plot,
+                           aes(x = median_conc, y = A595_from_curve, label = label),
+                           size = 3, color = "black") +
+  labs(title = "Standard curve with sample medians overlaid",
+       x = "Protein concentration (mg/mL = µg/µL)",
+       y = "A595 (blank-corrected)")
+ggpubr::ggpar(ov, legend = "none")
+```
+
+## Calculate loading volumes for 20/25/30 µg
+
+```{r}
+conc_col <- if (identical(params$summary_stat, "median")) "median_conc" else "mean_conc"
+loads <- tibble(Load_ug = unlist(params$loads_ug))
+
+vol_tbl <- summary_tbl %>%
+  mutate(Conc_used = .data[[conc_col]]) %>%
+  tidyr::crossing(loads) %>%
+  mutate(Volume_uL = ifelse(is.finite(Conc_used) & Conc_used > 0, Load_ug / Conc_used, NA_real_)) %>%
+  arrange(name, Load_ug) %>%
+  select(name, desc, Conc_used, Load_ug, Volume_uL, cv_percent, flag_high_CV)
+
+vp <- vol_tbl %>%
+  ggplot(aes(x = factor(Load_ug), y = Volume_uL, group = name, color = name)) +
+  geom_line(alpha = 0.4) + geom_point() +
+  labs(title = "Required lysate volume per desired load", x = "Desired load (µg)", y = "Volume (µL)") +
+  guides(color = "none")
+ggpubr::ggpar(vp)
+
+ggpubr::ggtexttable(head(vol_tbl, 12) |> mutate(across(where(is.numeric), ~round(.x, 3))))
+```
+
+## 7) Save outputs
+
+```{r out}
+out_dir <- dirname(normalizePath(path))
+write.csv(std_data,   file.path(out_dir, "bradford_standards_averaged.csv"), row.names = FALSE)
+write.csv(summary_tbl,file.path(out_dir, "bradford_samples_summary.csv"),    row.names = FALSE)
+write.csv(vol_tbl,    file.path(out_dir, "bradford_loading_volumes.csv"),    row.names = FALSE)
+
+cat("Saved CSVs to:", out_dir, "\n")
+```
+
+
+## Notes & QC
+R²: expect ≥0.98 for a good linear fit; if lower, consider limiting the fit to the linear range (set linear_cutoff <- 1.0 or 1.5 above).
+
+CV% flags: samples with flag_high_CV = TRUE (default >r params$cv_flag_threshold%) are worth re-reading or re-assaying.
+
+Loads: table gives exact µL to load for 20/25/30 µg per lane based on the r params$summary_stat concentration (median recommended).
